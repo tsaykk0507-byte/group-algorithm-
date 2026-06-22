@@ -2,9 +2,7 @@
 import re
 import math
 import random
-
-# 設定隨機對照組生成組數 (B)
-GAP_B_SAMPLES = 15
+from collections import defaultdict
 
 # ==============================================================================
 # 1. 基礎統計與數學工具
@@ -45,49 +43,12 @@ def get_median(lst):
     mid = n // 2
     return (sl[mid-1] + sl[mid]) / 2.0 if n % 2 == 0 else float(sl[mid])
 
-# 👑 修正版全域 Gap Statistic 計算工具（改為對稱自我評估，不再獨厚 K-Means）
-def calculate_gap_statistic(algorithm_func, clusters, flat_data, B=GAP_B_SAMPLES):
-    k = len(clusters)
-    n = len(flat_data)
-    if k == 0 or n <= 1: return 0.0
-        
-    wk_actual = 0.0
-    for c in clusters:
-        if not c['elements']: continue
-        mu = sum(c['elements']) / len(c['elements'])
-        wk_actual += sum((x - mu) ** 2 for x in c['elements'])
-        
-    log_wk_actual = math.log(wk_actual + 1e-10)
-    min_val, max_val = min(flat_data), max(flat_data)
-    if min_val == max_val: return 0.0
-        
-    log_wk_refs = []
-    for _ in range(B):
-        ref_data = sorted([random.uniform(min_val, max_val) for _ in range(n)])
-        # 🎯 修正點：對照組使用同一個演算法進行分群評估，確保基準公平
-        try:
-            ref_clusters, _ = algorithm_func(ref_data)
-            # 轉換格式以符合 W_k 計算需求
-            wk_ref = 0.0
-            for rc in ref_clusters:
-                if not rc['elements']: continue
-                mu_ref = sum(rc['elements']) / len(rc['elements'])
-                wk_ref += sum((rx - mu_ref) ** 2 for rx in rc['elements'])
-            log_wk_refs.append(math.log(wk_ref + 1e-10))
-        except:
-            log_wk_refs.append(log_wk_actual)
-            
-    expected_log_wk = sum(log_wk_refs) / len(log_wk_refs) if log_wk_refs else log_wk_actual
-    return max(0.0, expected_log_wk - log_wk_actual)
-
 # ==============================================================================
-# 2. 傳統 K-Means (修正初始化與空群 Bug)
+# 2. 傳統 K-Means
 # ==============================================================================
 def run_kmeans_core(flat_data, k):
     n = len(flat_data)
     if k >= n: return [[x] for x in flat_data], flat_data[:]
-    
-    # 🎯 修正點：改用分位數（Quantiles）初始化，避免等距初始化導致質心偏離或大量空群
     flat_data_sorted = sorted(flat_data)
     centroids = [flat_data_sorted[int(i * (n - 1) / (k - 1))] for i in range(k)] if k > 1 else [sum(flat_data)/n]
     
@@ -103,7 +64,6 @@ def run_kmeans_core(flat_data, k):
             if cluster:
                 new_centroids.append(sum(cluster) / len(cluster))
             else:
-                # 🎯 修正點：空群時隨機挑選一個當前數據點作為新質心，打破僵局
                 new_centroids.append(random.choice(flat_data))
         if sorted(centroids) == sorted(new_centroids): break
         centroids = new_centroids
@@ -140,10 +100,10 @@ def optimized_kmeans(flat_data):
     return sorted(result, key=lambda x: x['value']), best_k
 
 # ==============================================================================
-# 3. 傳統 GMM 高斯混合 (修正機率崩潰與數值穩定性 Bug)
+# 3. 傳統 GMM 高斯混合
 # ==============================================================================
 def pdf(x, mu, var):
-    if var < 1e-6: var = 1e-6  # 🎯 防禦方差過小
+    if var < 1e-6: var = 1e-6
     try:
         return (1.0 / math.sqrt(2 * math.pi * var)) * math.exp(-((x - mu)**2) / (2 * var))
     except OverflowError:
@@ -162,24 +122,21 @@ def run_gmm_core(flat_data, k):
     resp = [[0.0] * k for _ in range(n)]
     
     for _ in range(30):
-        # E-step
         for i in range(n):
             total_density = 0.0
             for j in range(k):
                 resp[i][j] = weights[j] * pdf(flat_data[i], means[j], vars_[j])
                 total_density += resp[i][j]
             if total_density < 1e-12:
-                # 🎯 修正點：若完全脫離所有成分，均勻平分而非產生極端權重震盪
                 resp[i] = [1.0 / k] * k
             else:
                 for j in range(k): resp[i][j] /= total_density
-        # M-step
         for j in range(k):
             N_j = sum(resp[i][j] for i in range(n))
             if N_j < 1e-4: N_j = 1e-4
             means[j] = sum(resp[i][j] * flat_data[i] for i in range(n)) / N_j
             vars_[j] = sum(resp[i][j] * (flat_data[i] - means[j])**2 for i in range(n)) / N_j
-            if vars_[j] < 1e-4: vars_[j] = 1e-4  # 🎯 方差下限保護
+            if vars_[j] < 1e-4: vars_[j] = 1e-4
             weights[j] = N_j / n
             
     log_likelihood = 0.0
@@ -214,7 +171,7 @@ def optimized_gmm(flat_data):
     return sorted(result, key=lambda x: x['value']), best_k
 
 # ==============================================================================
-# 4. 傳統 DBSCAN (修正核心點擴展與重複歸類 Bug)
+# 4. 傳統 DBSCAN
 # ==============================================================================
 def optimized_dbscan(flat_data):
     if not flat_data: return [], 0.0
@@ -225,15 +182,14 @@ def optimized_dbscan(flat_data):
     eps = sum(dists) / len(dists) * 0.5
     if eps == 0: eps = 1e-4
     
-    labels = [-1] * n  # -1 表示未分類/雜訊
+    labels = [-1] * n
     cluster_id = 0
     
-    # 🎯 修正點：嚴格按照標準 DBSCAN 兩階段核心點判定與蔓延邏輯
     for i in range(n):
         if labels[i] != -1: continue
         neighbors = [j for j in range(n) if abs(flat_data[i] - flat_data[j]) <= eps]
         
-        if len(neighbors) < 2:  # MinPts = 2
+        if len(neighbors) < 2:
             continue
             
         labels[i] = cluster_id
@@ -241,7 +197,7 @@ def optimized_dbscan(flat_data):
         
         while queue:
             current_idx = queue.pop(0)
-            if labels[current_idx] == -1:  # 雜訊變邊界點
+            if labels[current_idx] == -1:
                 labels[current_idx] = cluster_id
             elif labels[current_idx] != -1:
                 continue
@@ -261,14 +217,13 @@ def optimized_dbscan(flat_data):
     result = []
     for lid, elements in cluster_map.items():
         if lid == -1:
-            # 雜訊點各成一獨立核心群
             for e in elements: result.append({"value": e, "elements": [e]})
         else:
             result.append({"value": sum(elements) / len(elements), "elements": sorted(elements)})
     return sorted(result, key=lambda x: x['value']), eps
 
 # ==============================================================================
-# 5. 傳統 Mean Shift (修正為標準高斯核)
+# 5. 傳統 Mean Shift
 # ==============================================================================
 def run_mean_shift(flat_data):
     if not flat_data: return [], 0.0
@@ -283,8 +238,6 @@ def run_mean_shift(flat_data):
     for x in flat_data:
         current = x
         for _ in range(30):
-            # 🎯 修正點：改用標準高斯核權重代替 Flat Kernel，保證平滑收斂
-            weights = []
             total_w = 0.0
             num_sum = 0.0
             for p in flat_data:
@@ -300,7 +253,6 @@ def run_mean_shift(flat_data):
     unique_peaks = sorted(list(set(shifted_points)))
     clusters_dict = {}
     for pt, peak in zip(flat_data, shifted_points):
-        # 將漂移到相同峰值的點歸為同群
         closest_peak = min(unique_peaks, key=lambda p: abs(p - peak))
         if closest_peak not in clusters_dict: clusters_dict[closest_peak] = []
         clusters_dict[closest_peak].append(pt)
@@ -309,7 +261,7 @@ def run_mean_shift(flat_data):
     return sorted(result, key=lambda x: x['value']), bandwidth
 
 # ==============================================================================
-# 6. 傳統 AGNES 階層分群 (修正孤立點輪廓高估 Bug)
+# 6. 傳統 AGNES 階層分群
 # ==============================================================================
 def run_agnes_core(flat_data, k):
     clusters = [[x] for x in flat_data]
@@ -339,7 +291,6 @@ def optimized_agnes(flat_data):
         scores = []
         for c_idx, clus in enumerate(clusters):
             for x in clus:
-                # 🎯 修正點：孤立點（len==1）時，a_i 應視為 0，且不能跳過評估以免高估整體輪廓
                 a_i = sum(abs(x - y) for y in clus) / (len(clus) - 1) if len(clus) > 1 else 0.0
                 other_dists = []
                 for o_idx, other in enumerate(clusters):
@@ -358,7 +309,7 @@ def optimized_agnes(flat_data):
     return sorted(result, key=lambda x: x['value']), best_k
 
 # ==============================================================================
-# 7. 一維專用 Jenks 自然裂點法 (修正重合數據邊界與索引錯位 Bug)
+# 7. 一維專用 Jenks 自然裂點法
 # ==============================================================================
 def jenks_breaks(data, k):
     data = sorted(data)
@@ -381,7 +332,6 @@ def jenks_breaks(data, k):
             i4 = i3 - 1
             if i4 != 0:
                 for j in range(2, k + 1):
-                    # 🎯 修正點：嚴格限定大於，並加入 1e-9 擾動防止相同重複數據造成斷點死鎖
                     if mat2[l][j] > (v + mat2[i4][j - 1] + 1e-9):
                         mat2[l][j] = v + mat2[i4][j - 1]
                         mat1[l][j] = i3
@@ -434,7 +384,7 @@ def optimized_jenks(flat_data):
     return sorted(result, key=lambda x: x['value']), best_k
 
 # ==============================================================================
-# 8. 一維最優 K-Means (修正 L1/L2 度量衝突 Bug)
+# 8. 一維最優 K-Means
 # ==============================================================================
 def ckmeans_1d_dp(flat_data):
     n = len(flat_data)
@@ -453,7 +403,7 @@ def ckmeans_1d_dp(flat_data):
     
     best_k = k_range[0]
     best_clusters = []
-    best_score = float('inf') # 🎯 改為最小化全域平方誤差和
+    best_score = float('inf')
     
     for k in k_range:
         if k > n: continue
@@ -482,7 +432,6 @@ def ckmeans_1d_dp(flat_data):
             end_pos = breaks[idx+1]
             if start_pos < end_pos: clusters.append(flat_data[start_pos:end_pos])
             
-        # 🎯 修正點：外層尋參指標改為最小化平方變異和（與內部 L2 度量保持高度一致）
         total_ss = dp[k][n]
         if total_ss < best_score:
             best_score = total_ss
@@ -493,13 +442,12 @@ def ckmeans_1d_dp(flat_data):
     return sorted(result, key=lambda x: x['value']), best_k
 
 # ==============================================================================
-# 9. Bayesian Blocks 貝氏區塊法 (修正重複數值 w=0 崩潰 Bug)
+# 9. Bayesian Blocks 貝氏區塊法
 # ==============================================================================
 def bayesian_blocks(flat_data):
     n = len(flat_data)
     if n <= 1: return [{"value": flat_data[0], "elements": flat_data}], 1
     
-    # 🎯 修正點：對一維連續區間邊緣做微幅微擾，徹底根絕 w=0 的數學邊界崩潰
     edges = [flat_data[0] - 1e-5]
     for i in range(n - 1):
         edges.append((flat_data[i] + flat_data[i+1]) / 2.0)
@@ -542,7 +490,7 @@ def bayesian_blocks(flat_data):
     return sorted(result, key=lambda x: x['value']), len(result)
 
 # ==============================================================================
-# 10. Head/Tail Breaks 首尾斷裂法 (修正尾部數據丟失與未分群 Bug)
+# 10. Head/Tail Breaks 首尾斷裂法
 # ==============================================================================
 def head_tail_breaks(flat_data):
     def recursive_break(data, all_clusters):
@@ -553,7 +501,6 @@ def head_tail_breaks(flat_data):
         tail = [x for x in data if x <= mu]
         head = [x for x in data if x > mu]
         
-        # 🎯 修正點：將尾部（Tail）完整保留至當前層級群中，避免數據被吞噬丟失
         if tail: all_clusters.append(tail)
         
         if not head or (len(head) / len(data) > 0.40):
@@ -565,7 +512,6 @@ def head_tail_breaks(flat_data):
     all_clusters = []
     recursive_break(sorted(flat_data), all_clusters)
     
-    # 🎯 合併相同數值的微小次群以確保結構清晰
     merged_map = {}
     for clus in all_clusters:
         h_mean = round(sum(clus)/len(clus), 4)
@@ -576,7 +522,7 @@ def head_tail_breaks(flat_data):
     return sorted(result, key=lambda x: x['value']), len(result)
 
 # ==============================================================================
-# 11. KDE Valleys 核密度山谷硬切 (修正數據網格取樣溢出 Bug)
+# 11. KDE Valleys 核密度山谷硬切
 # ==============================================================================
 def kde_valleys(flat_data):
     n = len(flat_data)
@@ -587,7 +533,6 @@ def kde_valleys(flat_data):
     if bw < 1e-2: bw = 1e-2
     
     grid_size = 300
-    # 🎯 修正點：將格點網格範圍向外嚴格拓寬，防止極值數據在切分時發生索引漂移
     r_min, r_max = min(flat_data) - bw*3, max(flat_data) + bw*3
     grid = [r_min + i * (r_max - r_min) / (grid_size - 1) for i in range(grid_size)]
     
@@ -604,7 +549,6 @@ def kde_valleys(flat_data):
     
     clusters = []
     curr_cluster = []
-    # 🎯 修正點：完全依照山谷邊界進行多段式切分
     for x in sorted(flat_data):
         if valleys and x > valleys[0]:
             if curr_cluster:
@@ -619,14 +563,13 @@ def kde_valleys(flat_data):
     return sorted(result, key=lambda x: x['value']), len(result)
 
 # ==============================================================================
-# 12. HDBSCAN 一維自適應密度 (修正互達距離與 Lambda 生存核心)
+# 12. HDBSCAN 一維自適應密度
 # ==============================================================================
 def optimized_hdbscan(flat_data):
     n = len(flat_data)
     if n <= 2: return [{"value": flat_data[0], "elements": flat_data}], 1
     
     sorted_data = sorted(flat_data)
-    # 🎯 修正點：實作標準一維互達距離（Mutual Reachability）架構
     core_dists = []
     for i in range(n):
         dists = [abs(sorted_data[i] - sorted_data[j]) for j in range(n) if i != j]
@@ -642,7 +585,6 @@ def optimized_hdbscan(flat_data):
         clusters = []
         curr = [sorted_data[0]]
         for i in range(n - 1):
-            # 依據互達鄰域進行凝聚
             m_dist = max(sorted_data[i+1] - sorted_data[i], core_dists[i], core_dists[i+1])
             if m_dist <= eps * 2.0:
                 curr.append(sorted_data[i+1])
@@ -651,7 +593,6 @@ def optimized_hdbscan(flat_data):
                 curr = [sorted_data[i+1]]
         clusters.append(curr)
         
-        # 🎯 修正點：利用 Lambda 的生存跨度壽命估算集群穩定度（Stability）
         stability = sum(len(c) * (1.0 / (eps + 1e-6)) for c in clusters if len(c) > 1)
         if stability > max_stability:
             max_stability = stability
@@ -661,52 +602,8 @@ def optimized_hdbscan(flat_data):
     return sorted(result, key=lambda x: x['value']), len(result)
 
 # ==============================================================================
-# 13. V12 生死迭代演算法 (拓撲連續保護優化完全體)
+# 13. 👑 完全體 V12 生死迭代演算法
 # ==============================================================================
-def v12_clustering(flat_data):
-    pure_data = flatten_list(flat_data)
-    if len(pure_data) == 1: return [[pure_data[0]]], 0.0
-    gaps = [abs(pure_data[i+1] - pure_data[i]) for i in range(len(pure_data) - 1)]
-    threshold = get_median(gaps) if gaps else 0.0
-    
-    clusters = []
-    current = [pure_data[0]]
-    for i in range(len(gaps)):
-        if (gaps[i] - 1e-9) <= threshold: current.append(pure_data[i+1])
-        else: clusters.append(current); current = [pure_data[i+1]]
-    clusters.append(current)
-    return clusters, threshold
-
-def find_single_generation_cores(data_pool):
-    current_alive = sorted(flatten_list(data_pool))
-    generation_dead = []
-    while True:
-        if not current_alive: return [], []
-        clusters, _ = v12_clustering(current_alive)
-        max_size = max(len(c) for c in clusters)
-        max_size_clusters = [c for c in clusters if len(c) == max_size]
-        
-        if len(clusters) == 2:
-            next_alive = []
-            for c in clusters:
-                if len(c) == max_size: next_alive.extend(flatten_list(c))
-                else: generation_dead.extend(flatten_list(c))
-            next_alive = sorted(next_alive)
-            re_clusters, _ = v12_clustering(next_alive)
-            if len(re_clusters) != 1:
-                return [{"value": sum(flatten_list(rc)) / len(flatten_list(rc)), "elements": flatten_list(rc)} for rc in re_clusters], sorted(generation_dead)
-            elif len(re_clusters) == 1:
-                return [{"value": sum(flatten_list(re_clusters)) / len(flatten_list(re_clusters)), "elements": flatten_list(re_clusters)}], sorted(generation_dead)
-
-        if len(clusters) == 1 or len(max_size_clusters) == len(clusters):
-            return [{"value": sum(flatten_list(c)) / len(flatten_list(c)), "elements": flatten_list(c)} for c in clusters], sorted(generation_dead)
-
-        next_alive = []
-        for c in clusters:
-            if len(c) == max_size: next_alive.extend(flatten_list(c))
-            else: generation_dead.extend(flatten_list(c))
-        current_alive = sorted(next_alive)
-
 def split_by_original_continuity(core_elements, original_data):
     if len(core_elements) <= 1: return [core_elements]
     try:
@@ -735,35 +632,149 @@ def split_by_original_continuity(core_elements, original_data):
     if current_sub: sub_cores.append(current_sub)
     return sub_cores
 
-def run_v12(flat_data):
+def v12_core_split_visual(pure_data, generation_id, global_initial_threshold=None, threshold_multiplier=1.5):
+    if len(pure_data) <= 1: return [pure_data], 0.0
+    gaps = [abs(pure_data[i+1] - pure_data[i]) for i in range(len(pure_data) - 1)]
+    threshold = get_median(gaps)
+    
+    if len(pure_data) == 2 and global_initial_threshold is not None:
+        max_allowed_threshold = global_initial_threshold * threshold_multiplier
+        if threshold > max_allowed_threshold: threshold = max_allowed_threshold - 1e-9
+            
+    clusters = []
+    current = [pure_data[0]]
+    for i in range(len(gaps)):
+        if (gaps[i] - 1e-9) <= threshold: current.append(pure_data[i+1])
+        else:
+            clusters.append(current)
+            current = [pure_data[i+1]]
+    clusters.append(current)
+    return clusters, threshold
+
+def find_single_generation_cores_debug(data_pool, stage_counter, global_initial_threshold=None, threshold_multiplier=1.5):
+    current_alive = sorted(data_pool)
+    generation_dead = []
+    immediate_cores = []  
+    generation_id = 1
+    first_gen_threshold = None
+    
+    while True:
+        if not current_alive: return [], [], [], None
+        clusters, current_threshold = v12_core_split_visual(current_alive, generation_id, global_initial_threshold, threshold_multiplier)
+        
+        if stage_counter == 1 and generation_id == 1: first_gen_threshold = current_threshold
+        max_size = max(len(c) for c in clusters)
+        max_size_clusters = [c for c in clusters if len(c) == max_size]
+        
+        if len(clusters) == 2 and len(max_size_clusters) == 2:
+            next_alive = []
+            for c in clusters:
+                if len(c) == max_size: next_alive.extend(c)
+                else: generation_dead.extend(c)
+            next_alive = sorted(next_alive)
+            re_clusters, _ = v12_core_split_visual(next_alive, generation_id + 1, global_initial_threshold, threshold_multiplier)
+            return (re_clusters if len(re_clusters) != 1 else [next_alive]), sorted(generation_dead), immediate_cores, (global_initial_threshold or first_gen_threshold)
+
+        if len(clusters) == 1 or len(max_size_clusters) == len(clusters):
+            return clusters, sorted(generation_dead), immediate_cores, (global_initial_threshold or first_gen_threshold)
+
+        next_alive = []
+        active_global_thresh = global_initial_threshold if global_initial_threshold is not None else first_gen_threshold
+        limit = active_global_thresh * threshold_multiplier if active_global_thresh is not None else float('inf')
+
+        for c in clusters:
+            if len(c) == max_size: next_alive.extend(c)
+            else:
+                if generation_id > 1:
+                    sub_c = []
+                    curr_sub = [c[0]]
+                    for idx in range(len(c) - 1):
+                        gap = abs(c[idx+1] - c[idx])
+                        if gap <= limit: curr_sub.append(c[idx+1])
+                        else:
+                            sub_c.append(curr_sub)
+                            curr_sub = [c[idx+1]]
+                    sub_c.append(curr_sub)
+                    for sc in sub_c: immediate_cores.append(sc)
+                else: generation_dead.extend(c)
+        current_alive = sorted(next_alive)
+        generation_id += 1
+
+def run_v12_core_logic(flat_data, threshold_multiplier=1.5):
+    if not flat_data: return []
+    original_data = sorted(flat_data)
+    global_dead_zone = sorted(flat_data)
     all_cores = []
-    global_dead_zone = sorted(flatten_list(flat_data))
-    original_data = sorted(flatten_list(flat_data))
+    stage_counter = 1
+    global_initial_threshold = None
     
     while global_dead_zone:
-        cores, dead_data = find_single_generation_cores(global_dead_zone)
-        for core in cores:
-            elements = core['elements']
-            split_elements_list = split_by_original_continuity(elements, original_data)
-            for sub_elements in split_elements_list:
-                if sub_elements:
-                    all_cores.append({
-                        "value": sum(sub_elements) / len(sub_elements),
-                        "elements": sub_elements
-                    })
-        global_dead_zone = sorted(flatten_list(dead_data))
+        cores, dead_data, immediate_cores, first_thresh = find_single_generation_cores_debug(global_dead_zone, stage_counter, global_initial_threshold, threshold_multiplier)
+        if stage_counter == 1 and first_thresh is not None: global_initial_threshold = first_thresh
+        
+        for core_list in (cores + immediate_cores):
+            for sub_elements in split_by_original_continuity(core_list, original_data):
+                if sub_elements: all_cores.append({"value": sum(sub_elements) / len(sub_elements), "elements": sub_elements})
+        if len(global_dead_zone) == len(dead_data): break
+        global_dead_zone = sorted(dead_data)
+        stage_counter += 1
+        
+    num_elements = len(original_data)
+    if num_elements >= 3:
+        used = [False] * num_elements
+        v12_core_indices = []
+        for c in all_cores:
+            current_core_idx = []
+            for elem in c["elements"]:
+                for i in range(num_elements):
+                    if not used[i] and original_data[i] == elem:
+                        used[i] = True; current_core_idx.append(i); break
+            v12_core_indices.append(sorted(current_core_idx))
+            
+        gaps = [abs(original_data[i+1] - original_data[i]) for i in range(num_elements - 1)]
+        ap_blocks = []
+        i = 0
+        while i < len(gaps):
+            j = i
+            while j < len(gaps) and abs(gaps[j] - gaps[i]) < 1e-9: j += 1
+            if (j - i) >= 2: ap_blocks.append(list(range(i, j + 1))); i = j
+            else: i += 1
+        for k in range(len(ap_blocks) - 1):
+            if ap_blocks[k][-1] == ap_blocks[k+1][0]: ap_blocks[k].pop()
+        belongs_to_ap = [None] * num_elements
+        for block_id, block in enumerate(ap_blocks):
+            for idx in block: belongs_to_ap[idx] = block_id
+                
+        parent = list(range(num_elements))
+        def find_root(idx):
+            if parent[idx] == idx: return idx
+            parent[idx] = find_root(parent[idx]); return parent[idx]
+        def union_nodes(idx1, idx2):
+            r1, r2 = find_root(idx1), find_root(idx2)
+            if r1 != r2: parent[r1] = r2
+
+        for block in ap_blocks:
+            for idx in range(len(block) - 1): union_nodes(block[idx], block[idx+1])
+        for current_core_idx in v12_core_indices:
+            for idx in range(len(current_core_idx) - 1):
+                i1, i2 = current_core_idx[idx], current_core_idx[idx+1]
+                if not (belongs_to_ap[i1] is not None and belongs_to_ap[i2] is not None and belongs_to_ap[i1] != belongs_to_ap[i2]): union_nodes(i1, i2)
+                    
+        components = defaultdict(list)
+        for idx in range(num_elements): components[find_root(idx)].append(idx)
+        all_cores = [{"value": sum(original_data[idx] for idx in sorted(ids)) / len(ids), "elements": [original_data[idx] for idx in sorted(ids)]} for ids in components.values()]
+        
     return sorted(all_cores, key=lambda x: x['value'])
+
+def run_v12(flat_data):
+    cores = run_v12_core_logic(flat_data, threshold_multiplier=1.5)
+    return cores, len(cores)
 
 # ==============================================================================
 # 格式化輸出工具
 # ==============================================================================
-def print_method_result(title, algorithm_func, clusters, flat_data, debug_info=""):
-    # 調用公平對稱的 Gap Statistic 計算機
-    gap_score = calculate_gap_statistic(algorithm_func, clusters, flat_data)
-    
+def print_method_result(title, clusters, debug_info=""):
     print(f"\n🎬 【{title}】共提煉出 {len(clusters)} 個群 {debug_info}")
-    print(f"  📊 該演算法最終分群的全域『 🌟 Gap Statistic 』:  {gap_score:.4f}")
-    
     for idx, c in enumerate(clusters):
         elements_str = ", ".join([str(round(x, 1)) for x in c['elements']])
         print(f"    📦 Core #{idx} -> 平均值: {c['value']:.2f} | 包含元素: [{elements_str}]")
@@ -771,7 +782,7 @@ def print_method_result(title, algorithm_func, clusters, flat_data, debug_info="
 
 def main():
     print("==================================================================")
-    print("【👑 諸神黃昏：全自動優化尋參分群觀測器 V6.0 (邏輯修正公平對決版)】")
+    print("【👑 諸神黃昏：全自動優化尋參分群觀測器 V6.1 精簡極速版】")
     print("==================================================================")
     while True:
         user_input = input("\n請輸入您的數列 (或輸入 'exit' 結束): ").strip()
@@ -781,54 +792,41 @@ def main():
         print(f"\n🚀 輸入的原始數據 (計 {len(flat_data)} 個) : {flat_data}")
         print("=" * 60)
         
-        # 1. K-Means
         km_res, km_k = optimized_kmeans(flat_data)
-        print_method_result("1. 傳統 K-Means (分位數優化初始化)", optimized_kmeans, km_res, flat_data, f"(最佳 K={km_k})")
+        print_method_result("1. 傳統 K-Means (分位數優化初始化)", km_res, f"(最佳 K={km_k})")
         
-        # 2. GMM
         gmm_res, gmm_k = optimized_gmm(flat_data)
-        print_method_result("2. 傳統 GMM 高斯混合 (數值穩定修正)", optimized_gmm, gmm_res, flat_data, f"(最佳 K={gmm_k})")
+        print_method_result("2. 傳統 GMM 高斯混合 (數值穩定修正)", gmm_res, f"(最佳 K={gmm_k})")
         
-        # 3. DBSCAN
         db_res, db_eps = optimized_dbscan(flat_data)
-        print_method_result("3. 傳統 DBSCAN 密度分群 (標準蔓延機制)", optimized_dbscan, db_res, flat_data, f"(半徑 eps={db_eps:.2f})")
+        print_method_result("3. 傳統 DBSCAN 密度分群 (標準蔓延機制)", db_res, f"(半徑 eps={db_eps:.2f})")
         
-        # 4. Mean Shift
         ms_res, ms_bw = run_mean_shift(flat_data)
-        print_method_result("4. 傳統 Mean Shift (標準高斯核優化)", run_mean_shift, ms_res, flat_data, f"(頻寬 bw={ms_bw:.2f})")
+        print_method_result("4. 傳統 Mean Shift (標準高斯核優化)", ms_res, f"(頻寬 bw={ms_bw:.2f})")
         
-        # 5. AGNES
         ag_res, ag_k = optimized_agnes(flat_data)
-        print_method_result("5. 傳統 AGNES 階層分群 (孤立點懲罰修正)", optimized_agnes, ag_res, flat_data, f"(最佳 K={ag_k})")
+        print_method_result("5. 傳統 AGNES 階層分群 (孤立點懲罰修正)", ag_res, f"(最佳 K={ag_k})")
         
-        # 6. Jenks
         jk_res, jk_k = optimized_jenks(flat_data)
-        print_method_result("6. 一維專用 Jenks 自然裂點法 (微擾防死鎖)", optimized_jenks, jk_res, flat_data, f"(最佳 K={jk_k})")
+        print_method_result("6. 一維專用 Jenks 自然裂點法 (微擾防死鎖)", jk_res, f"(最佳 K={jk_k})")
         
-        # 7. Ckmeans
         dp_res, dp_k = ckmeans_1d_dp(flat_data)
-        print_method_result("7. 🌟 一維最優 K-Means (L2 平方和指標一致)", ckmeans_1d_dp, dp_res, flat_data, f"(最佳 K={dp_k})")
+        print_method_result("7. 🌟 一維最優 K-Means (L2 平方和指標一致)", dp_res, f"(最佳 K={dp_k})")
         
-        # 8. Bayesian Blocks
         bb_res, bb_k = bayesian_blocks(flat_data)
-        print_method_result("8. 🌟 Bayesian Blocks (微幅微擾無損變點偵測)", bayesian_blocks, bb_res, flat_data, f"(區塊數 K={bb_k})")
+        print_method_result("8. 🌟 Bayesian Blocks (微幅微擾無損變點偵測)", bb_res, f"(區塊數 K={bb_k})")
         
-        # 9. Head/Tail Breaks
         ht_res, ht_k = head_tail_breaks(flat_data)
-        print_method_result("9. 🌟 Head/Tail Breaks (尾部防丟失修正)", head_tail_breaks, ht_res, flat_data, f"(遞迴切分 K={ht_k})")
+        print_method_result("9. 🌟 Head/Tail Breaks (尾部防丟失修正)", ht_res, f"(遞迴切分 K={ht_k})")
         
-        # 10. KDE Valleys
         kde_res, kde_k = kde_valleys(flat_data)
-        print_method_result("10. 🌟 KDE Valleys (網格拓寬防漂移切分)", kde_valleys, kde_res, flat_data, f"(捕捉山谷 K={kde_k})")
+        print_method_result("10. 🌟 KDE Valleys (網格拓寬防漂移切分)", kde_res, f"(捕捉山谷 K={kde_k})")
         
-        # 11. HDBSCAN
         hdb_res, hdb_k = optimized_hdbscan(flat_data)
-        print_method_result("11. 🌟 HDBSCAN (一維互達距離生存樹簡化)", optimized_hdbscan, hdb_res, flat_data, f"(穩健核心 K={hdb_k})")
+        print_method_result("11. 🌟 HDBSCAN (一維互達距離生存樹簡化)", hdb_res, f"(穩健核心 K={hdb_k})")
         
-        # 12. V12
-        v12_res = run_v12(flat_data)
-        print_method_result("12. 👑 你的 V12 生死迭代演算法 (原生自適應解構)", run_v12, v12_res, flat_data, "")
+        v12_res, v12_k = run_v12(flat_data)
+        print_method_result("12. 👑 完全體 V12 生死迭代演算法 (AP保護與DSU熔接)", v12_res, f"(終極收斂 K={v12_k})")
 
 if __name__ == "__main__":
     main()
-     
